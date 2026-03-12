@@ -60,6 +60,14 @@ struct JXLDecompressParams {
   // the full size is requested.
   size_t max_downsampling = 1;
 
+  // Optional decode region in oriented output coordinates.
+  // When enabled, only this rectangle is output.
+  bool decode_region = false;
+  size_t region_x0 = 0;
+  size_t region_y0 = 0;
+  size_t region_xsize = 0;
+  size_t region_ysize = 0;
+
   // Whether to use the image callback or the image buffer to get the output.
   bool use_image_callback = true;
   // Whether to unpremultiply colors for associated alpha channels.

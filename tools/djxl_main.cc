@@ -8,6 +8,7 @@
 #include <jxl/thread_parallel_runner_cxx.h>
 #include <jxl/types.h>
 
+#include <cerrno>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -16,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -34,6 +36,67 @@
 
 namespace jpegxl {
 namespace tools {
+
+struct DecodeRegion {
+  size_t x0 = 0;
+  size_t y0 = 0;
+  size_t x1 = 0;
+  size_t y1 = 0;
+  bool enabled = false;
+};
+
+bool ParseDecodeRegion(const char* arg, DecodeRegion* out) {
+  if (out == nullptr) {
+    fprintf(stderr, "Internal error while parsing --region\n");
+    return false;
+  }
+
+  size_t values[4] = {0, 0, 0, 0};
+  const char* next = arg;
+  for (size_t i = 0; i < 4; ++i) {
+    if (*next == '-') {
+      fprintf(stderr,
+              "Unable to parse --region. Expected x0,y0,x1,y1 but got: %s.\n",
+              arg);
+      return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long value = strtoull(next, &end, 10);
+    if (errno == ERANGE || end == next ||
+        value > std::numeric_limits<size_t>::max()) {
+      fprintf(stderr,
+              "Unable to parse --region. Expected x0,y0,x1,y1 but got: %s.\n",
+              arg);
+      return false;
+    }
+
+    if (i < 3) {
+      if (*end != ',') {
+        fprintf(
+            stderr,
+            "Unable to parse --region. Expected x0,y0,x1,y1 but got: %s.\n",
+            arg);
+        return false;
+      }
+      next = end + 1;
+    } else if (*end != '\0') {
+      fprintf(stderr,
+              "Unable to parse --region. Expected x0,y0,x1,y1 but got: %s.\n",
+              arg);
+      return false;
+    }
+
+    values[i] = static_cast<size_t>(value);
+  }
+
+  out->x0 = values[0];
+  out->y0 = values[1];
+  out->x1 = values[2];
+  out->y1 = values[3];
+  out->enabled = true;
+  return true;
+}
 
 struct DecompressArgs {
   DecompressArgs() = default;
@@ -114,6 +177,13 @@ struct DecompressArgs {
                             "    only decode what is needed to produce an "
                             "image intended for this downsampling ratio.",
                             &downsampling, &ParseUint32, 1);
+
+    cmdline->AddOptionValue(
+        '\0', "region", "X0,Y0,X1,Y1",
+        "Output only this rectangle in full-image pixel coordinates.\n"
+      "    Note: decoding may still process pixels outside the region.\n"
+        "    X1 and Y1 are exclusive. Example: --region=1024,1024,2048,2048",
+        &region, &ParseDecodeRegion, 1);
 
     cmdline->AddOptionFlag('\0', "allow_partial_files",
                            "Allow decoding of truncated files.",
@@ -238,6 +308,23 @@ struct DecompressArgs {
           "Invalid flag value for --num_threads: must be -1, 0 or positive.\n");
       return false;
     }
+    if (region.enabled) {
+      if (region.x1 <= region.x0 || region.y1 <= region.y0) {
+        fprintf(stderr,
+                "Invalid --region: expected x1 > x0 and y1 > y0.\n");
+        return false;
+      }
+      if (!coalescing) {
+        fprintf(stderr,
+                "--region currently requires coalescing (default).\n");
+        return false;
+      }
+      if (reconstruct_jpeg) {
+        fprintf(stderr,
+                "--region cannot be used with --reconstruct_jpeg.\n");
+        return false;
+      }
+    }
     return true;
   }
 
@@ -253,6 +340,7 @@ struct DecompressArgs {
   double display_nits = 0.0;
   std::string color_space;
   uint32_t downsampling = 0;
+  DecodeRegion region;
   bool allow_partial_files = false;
   bool pixels_to_jpeg = false;
   bool reconstruct_jpeg = false;
@@ -404,6 +492,13 @@ bool DecompressJxlToPackedPixelFile(
   dparams.runner = JxlThreadParallelRunner;
   dparams.runner_opaque = runner;
   dparams.allow_partial_input = args.allow_partial_files;
+  if (args.region.enabled) {
+    dparams.decode_region = true;
+    dparams.region_x0 = args.region.x0;
+    dparams.region_y0 = args.region.y0;
+    dparams.region_xsize = args.region.x1 - args.region.x0;
+    dparams.region_ysize = args.region.y1 - args.region.y0;
+  }
   if (!accepts_cmyk) dparams.color_space_for_cmyk = "sRGB";
   if (args.bits_per_sample == 0) {
     dparams.output_bitdepth.type = JXL_BIT_DEPTH_FROM_CODESTREAM;
@@ -467,6 +562,10 @@ int main(int argc, const char* argv[]) {
   if (!args.quiet) {
     cmdline.VerbosePrintf(1, "Read %" PRIuS " compressed bytes.\n",
                           compressed.size());
+    if (args.region.enabled) {
+      cmdline.VerbosePrintf(
+          0, "Note: --region may still decode outside the requested region.\n");
+    }
   }
 
   if (!args.file_out && !args.disable_output) {
@@ -535,6 +634,9 @@ int main(int argc, const char* argv[]) {
   if (args.opt_jpeg_quality_id >= 0 &&
       (args.pixels_to_jpeg ||
        cmdline.GetOption(args.opt_jpeg_quality_id)->matched())) {
+    decode_to_pixels = true;
+  }
+  if (args.region.enabled) {
     decode_to_pixels = true;
   }
 

@@ -227,6 +227,24 @@ bool DecodeImageJXL(const uint8_t* bytes, size_t bytes_size,
       fprintf(stderr, "JxlDecoderSetCoalescing failed\n");
       return false;
     }
+    if (dparams.decode_region) {
+      if (dparams.region_x0 > std::numeric_limits<uint32_t>::max() ||
+          dparams.region_y0 > std::numeric_limits<uint32_t>::max() ||
+          dparams.region_xsize > std::numeric_limits<uint32_t>::max() ||
+          dparams.region_ysize > std::numeric_limits<uint32_t>::max()) {
+        fprintf(stderr, "Decode region exceeds decoder API range\n");
+        return false;
+      }
+      if (JXL_DEC_SUCCESS !=
+          JxlDecoderSetDecodeRegion(
+              dec, static_cast<uint32_t>(dparams.region_x0),
+              static_cast<uint32_t>(dparams.region_y0),
+              static_cast<uint32_t>(dparams.region_xsize),
+              static_cast<uint32_t>(dparams.region_ysize))) {
+        fprintf(stderr, "JxlDecoderSetDecodeRegion failed\n");
+        return false;
+      }
+    }
     if (dparams.display_nits > 0 &&
         JXL_DEC_SUCCESS !=
             JxlDecoderSetDesiredIntensityTarget(dec, dparams.display_nits)) {

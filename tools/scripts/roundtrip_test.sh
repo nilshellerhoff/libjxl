@@ -101,6 +101,46 @@ roundtrip_test() {
   fi
 }
 
+region_decode_test() {
+  local infn="${JPEGXL_TEST_DATA_PATH}/$1"
+  local jxlfn="$(mktemp -p "$tmpdir")"
+  local outfn="$(mktemp -p "$tmpdir").ppm"
+
+  "${encoder}" "${infn}" "${jxlfn}" -e 1
+  "${decoder}" "${jxlfn}" "${outfn}" --output_format ppm --region=10,20,30,60
+
+  python3 - <<'PY' "${outfn}"
+import sys
+
+path = sys.argv[1]
+with open(path, 'rb') as f:
+    magic = f.readline().strip()
+    if magic not in (b'P5', b'P6'):
+        raise SystemExit(f'Unexpected PNM magic: {magic!r}')
+
+    tokens = []
+    while len(tokens) < 3:
+        line = f.readline()
+        if not line:
+            raise SystemExit('Unexpected EOF while parsing PNM header')
+        line = line.strip()
+        if not line or line.startswith(b'#'):
+            continue
+        tokens.extend(line.split())
+
+    width = int(tokens[0])
+    height = int(tokens[1])
+    if width != 20 or height != 40:
+        raise SystemExit(f'Unexpected ROI dimensions: {width}x{height}')
+PY
+
+  if "${decoder}" "${jxlfn}" "${outfn}" --output_format ppm \
+      --region=30,30,10,40; then
+    echo "Expected --region with x1 <= x0 to fail"
+    exit 1
+  fi
+}
+
 main() {
   local tmpdir=$(mktemp -d)
   CLEANUP_FILES+=("${tmpdir}")
@@ -127,6 +167,7 @@ main() {
   roundtrip_test "jxl/flower/flower_cropped.jpg" "-e 1" 0.0
 
   roundtrip_test "jxl/flower/flower.png" "-e 6" 0.02
+  region_decode_test "jxl/flower/flower_small.rgb.png"
 
   roundtrip_lossless_pnm_test "jxl/flower/flower_small.rgb.depth1.ppm"
   roundtrip_lossless_pnm_test "jxl/flower/flower_small.g.depth1.pgm"

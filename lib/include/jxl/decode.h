@@ -380,6 +380,7 @@ typedef enum {
  * The difference to @ref JxlDecoderReset is that some state is kept, namely
  * settings set by a call to
  *  - @ref JxlDecoderSetCoalescing,
+ *  - @ref JxlDecoderSetDecodeRegion,
  *  - @ref JxlDecoderSetDesiredIntensityTarget,
  *  - @ref JxlDecoderSetDecompressBoxes,
  *  - @ref JxlDecoderSetKeepOrientation,
@@ -555,6 +556,27 @@ JxlDecoderSetRenderSpotcolors(JxlDecoder* dec, JXL_BOOL render_spotcolors);
  */
 JXL_EXPORT JxlDecoderStatus JxlDecoderSetCoalescing(JxlDecoder* dec,
                                                     JXL_BOOL coalescing);
+
+/** Requests output for only a sub-rectangle of the oriented full image.
+ *
+ * The decoder may still internally decode outside the requested rectangle.
+ * The output returned through @ref JxlDecoderSetImageOutBuffer or @ref
+ * JxlDecoderSetImageOutCallback is clipped to this region, with coordinates
+ * relative to the top-left corner of the region.
+ *
+ * This setting affects full-image output only (not preview output) and must be
+ * called before decoding starts.
+ *
+ * @param dec decoder object
+ * @param x0 left coordinate of the region in oriented pixel coordinates
+ * @param y0 top coordinate of the region in oriented pixel coordinates
+ * @param xsize width of the region in pixels (must be > 0)
+ * @param ysize height of the region in pixels (must be > 0)
+ * @return ::JXL_DEC_SUCCESS on success, ::JXL_DEC_ERROR otherwise.
+ */
+JXL_EXPORT JxlDecoderStatus JxlDecoderSetDecodeRegion(
+    JxlDecoder* dec, uint32_t x0, uint32_t y0, uint32_t xsize,
+    uint32_t ysize);
 
 /**
  * Decodes JPEG XL file using the available bytes. Requires input has been

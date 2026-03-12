@@ -426,6 +426,26 @@ struct JxlDecoder {
   bool render_spotcolors;
   bool coalescing;
   float desired_intensity_target;
+  bool decode_region_set;
+  size_t decode_region_x0;
+  size_t decode_region_y0;
+  size_t decode_region_xsize;
+  size_t decode_region_ysize;
+
+  struct RegionImageOut {
+    size_t x0;
+    size_t y0;
+    size_t xsize;
+    size_t ysize;
+    size_t x1;
+    size_t y1;
+    JxlPixelFormat format;
+    void* user_buffer;
+    size_t user_buffer_size;
+    size_t user_stride;
+    jxl::PixelCallback user_callback;
+    void* user_run_opaque;
+  } region_image_out;
 
   // Bitfield, for which informative events (JXL_DEC_BASIC_INFO, etc...) the
   // decoder returns a status. By default, do not return for any of the events,
@@ -737,6 +757,7 @@ void JxlDecoderRewindDecodingState(JxlDecoder* dec) {
   dec->image_out_size = 0;
   dec->image_out_bit_depth.type = JXL_BIT_DEPTH_FROM_PIXEL_FORMAT;
   dec->extra_channel_output.clear();
+  dec->region_image_out = {};
   dec->next_in = nullptr;
   dec->avail_in = 0;
   dec->input_closed = false;
@@ -775,6 +796,11 @@ void JxlDecoderReset(JxlDecoder* dec) {
   dec->render_spotcolors = true;
   dec->coalescing = true;
   dec->desired_intensity_target = 0;
+  dec->decode_region_set = false;
+  dec->decode_region_x0 = 0;
+  dec->decode_region_y0 = 0;
+  dec->decode_region_xsize = 0;
+  dec->decode_region_ysize = 0;
   dec->orig_events_wanted = 0;
   dec->events_wanted = 0;
   dec->frame_refs.clear();
@@ -916,7 +942,30 @@ JxlDecoderStatus JxlDecoderSetCoalescing(JxlDecoder* dec, JXL_BOOL coalescing) {
   if (dec->stage != DecoderStage::kInited) {
     return JXL_API_ERROR("Must set coalescing option before starting");
   }
+  if (dec->decode_region_set && !FROM_JXL_BOOL(coalescing)) {
+    return JXL_API_ERROR("Decode region requires coalescing");
+  }
   dec->coalescing = FROM_JXL_BOOL(coalescing);
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus JxlDecoderSetDecodeRegion(JxlDecoder* dec, uint32_t x0,
+                                           uint32_t y0, uint32_t xsize,
+                                           uint32_t ysize) {
+  if (dec->stage != DecoderStage::kInited) {
+    return JXL_API_ERROR("Must set decode region before starting");
+  }
+  if (!dec->coalescing) {
+    return JXL_API_ERROR("Decode region requires coalescing");
+  }
+  if (xsize == 0 || ysize == 0) {
+    return JXL_API_ERROR("Decode region dimensions must be non-zero");
+  }
+  dec->decode_region_set = true;
+  dec->decode_region_x0 = x0;
+  dec->decode_region_y0 = y0;
+  dec->decode_region_xsize = xsize;
+  dec->decode_region_ysize = ysize;
   return JXL_DEC_SUCCESS;
 }
 
@@ -939,6 +988,124 @@ void GetCurrentDimensions(const JxlDecoder* dec, size_t& xsize, size_t& ysize) {
       std::swap(xsize, ysize);
     }
   }
+}
+
+bool DecodeRegionAppliesToCurrentImage(const JxlDecoder* dec) {
+  return dec->decode_region_set && !dec->frame_header->nonserialized_is_preview;
+}
+
+JxlDecoderStatus GetDecodeRegionForImage(const JxlDecoder* dec,
+                                         size_t full_xsize,
+                                         size_t full_ysize, size_t* x0,
+                                         size_t* y0, size_t* xsize,
+                                         size_t* ysize) {
+  if (!dec->decode_region_set) {
+    return JXL_DEC_SUCCESS;
+  }
+  if (dec->decode_region_xsize == 0 || dec->decode_region_ysize == 0) {
+    return JXL_API_ERROR("Decode region dimensions must be non-zero");
+  }
+  if (dec->decode_region_x0 >= full_xsize || dec->decode_region_y0 >= full_ysize) {
+    return JXL_API_ERROR("Decode region origin is out of image bounds");
+  }
+  if (OutOfBounds(dec->decode_region_x0, dec->decode_region_xsize, full_xsize) ||
+      OutOfBounds(dec->decode_region_y0, dec->decode_region_ysize,
+                  full_ysize)) {
+    return JXL_API_ERROR("Decode region exceeds image bounds");
+  }
+  *x0 = dec->decode_region_x0;
+  *y0 = dec->decode_region_y0;
+  *xsize = dec->decode_region_xsize;
+  *ysize = dec->decode_region_ysize;
+  return JXL_DEC_SUCCESS;
+}
+
+JxlDecoderStatus GetCurrentOutputDimensions(const JxlDecoder* dec, bool preview,
+                                            size_t* xsize, size_t* ysize) {
+  if (preview) {
+    *xsize = dec->metadata.oriented_preview_xsize(dec->keep_orientation);
+    *ysize = dec->metadata.oriented_preview_ysize(dec->keep_orientation);
+    return JXL_DEC_SUCCESS;
+  }
+
+  GetCurrentDimensions(dec, *xsize, *ysize);
+  if (!DecodeRegionAppliesToCurrentImage(dec)) {
+    return JXL_DEC_SUCCESS;
+  }
+
+  size_t x0;
+  size_t y0;
+  size_t region_xsize;
+  size_t region_ysize;
+  JXL_API_RETURN_IF_ERROR(GetDecodeRegionForImage(
+      dec, *xsize, *ysize, &x0, &y0, &region_xsize, &region_ysize));
+  *xsize = region_xsize;
+  *ysize = region_ysize;
+  return JXL_DEC_SUCCESS;
+}
+
+void* RegionImageOutInit(void* init_opaque, size_t num_threads,
+                         size_t num_pixels_per_thread) {
+  auto* region = static_cast<JxlDecoder::RegionImageOut*>(init_opaque);
+  region->user_run_opaque = nullptr;
+  if (!region->user_callback.IsPresent()) {
+    return region;
+  }
+  region->user_run_opaque =
+      region->user_callback.Init(num_threads, num_pixels_per_thread);
+  if (region->user_run_opaque == nullptr) {
+    return nullptr;
+  }
+  return region;
+}
+
+void RegionImageOutRun(void* run_opaque, size_t thread_id, size_t x, size_t y,
+                       size_t num_pixels, const void* pixels) {
+  auto* region = static_cast<JxlDecoder::RegionImageOut*>(run_opaque);
+  if (y < region->y0 || y >= region->y1) {
+    return;
+  }
+  if (num_pixels == 0) {
+    return;
+  }
+  if (x + num_pixels < x) {
+    return;
+  }
+  const size_t x_end = x + num_pixels;
+  if (x_end <= region->x0 || x >= region->x1) {
+    return;
+  }
+
+  const size_t clipped_x0 = std::max(x, region->x0);
+  const size_t clipped_x1 = std::min(x_end, region->x1);
+  const size_t clipped_len = clipped_x1 - clipped_x0;
+  const size_t bytes_per_channel =
+      BitsPerChannel(region->format.data_type) / jxl::kBitsPerByte;
+  const size_t pixel_stride = region->format.num_channels * bytes_per_channel;
+  const uint8_t* src = reinterpret_cast<const uint8_t*>(pixels) +
+                       (clipped_x0 - x) * pixel_stride;
+  const size_t out_x = clipped_x0 - region->x0;
+  const size_t out_y = y - region->y0;
+
+  if (region->user_callback.IsPresent()) {
+    region->user_callback.run(region->user_run_opaque, thread_id, out_x, out_y,
+                              clipped_len, src);
+    return;
+  }
+
+  const size_t offset = out_y * region->user_stride + out_x * pixel_stride;
+  const size_t num_bytes = clipped_len * pixel_stride;
+  JXL_DASSERT(!OutOfBounds(offset, num_bytes, region->user_buffer_size));
+  memcpy(reinterpret_cast<uint8_t*>(region->user_buffer) + offset, src,
+         num_bytes);
+}
+
+void RegionImageOutDestroy(void* run_opaque) {
+  auto* region = static_cast<JxlDecoder::RegionImageOut*>(run_opaque);
+  if (!region->user_callback.IsPresent()) {
+    return;
+  }
+  region->user_callback.destroy(region->user_run_opaque);
 }
 }  // namespace
 
@@ -1407,14 +1574,64 @@ JxlDecoderStatus JxlDecoderProcessCodestream(JxlDecoder* dec) {
         size_t xsize;
         size_t ysize;
         GetCurrentDimensions(dec, xsize, ysize);
+        PixelCallback pixel_callback{dec->image_out_init_callback,
+                                     dec->image_out_run_callback,
+                                     dec->image_out_destroy_callback,
+                                     dec->image_out_init_opaque};
+        void* image_buffer = dec->image_out_buffer;
+        size_t image_out_size = dec->image_out_size;
+
+        if (DecodeRegionAppliesToCurrentImage(dec)) {
+          if (!dec->coalescing) {
+            return JXL_API_ERROR("Decode region requires coalescing");
+          }
+          if (!dec->extra_channel_output.empty()) {
+            return JXL_API_ERROR(
+                "Extra channel output with decode region is not supported");
+          }
+          size_t region_x0;
+          size_t region_y0;
+          size_t region_xsize;
+          size_t region_ysize;
+          JXL_API_RETURN_IF_ERROR(GetDecodeRegionForImage(
+              dec, xsize, ysize, &region_x0, &region_y0, &region_xsize,
+              &region_ysize));
+
+          dec->region_image_out = {};
+          dec->region_image_out.x0 = region_x0;
+          dec->region_image_out.y0 = region_y0;
+          dec->region_image_out.xsize = region_xsize;
+          dec->region_image_out.ysize = region_ysize;
+          dec->region_image_out.x1 = region_x0 + region_xsize;
+          dec->region_image_out.y1 = region_y0 + region_ysize;
+          dec->region_image_out.format = dec->image_out_format;
+          dec->region_image_out.user_buffer = dec->image_out_buffer;
+          dec->region_image_out.user_buffer_size = dec->image_out_size;
+          dec->region_image_out.user_callback = pixel_callback;
+
+          const size_t bits = BitsPerChannel(dec->image_out_format.data_type);
+          size_t row_size = jxl::DivCeil(
+              region_xsize * dec->image_out_format.num_channels * bits,
+              jxl::kBitsPerByte);
+          if (dec->image_out_format.align > 1) {
+            row_size =
+                jxl::DivCeil(row_size, dec->image_out_format.align) *
+                dec->image_out_format.align;
+          }
+          dec->region_image_out.user_stride = row_size;
+
+          pixel_callback =
+              PixelCallback{RegionImageOutInit, RegionImageOutRun,
+                            RegionImageOutDestroy, &dec->region_image_out};
+          image_buffer = nullptr;
+          image_out_size = 0;
+        }
+
         size_t bits_per_sample = GetBitDepth(
             dec->image_out_bit_depth, dec->metadata.m, dec->image_out_format);
         dec->frame_dec->SetImageOutput(
-            PixelCallback{
-                dec->image_out_init_callback, dec->image_out_run_callback,
-                dec->image_out_destroy_callback, dec->image_out_init_opaque},
-            reinterpret_cast<uint8_t*>(dec->image_out_buffer),
-            dec->image_out_size, xsize, ysize, dec->image_out_format,
+            pixel_callback, reinterpret_cast<uint8_t*>(image_buffer),
+            image_out_size, xsize, ysize, dec->image_out_format,
             bits_per_sample, dec->unpremul_alpha, !dec->keep_orientation);
         for (size_t i = 0; i < dec->extra_channel_output.size(); ++i) {
           const auto& extra = dec->extra_channel_output[i];
@@ -2109,6 +2326,17 @@ JxlDecoderStatus JxlDecoderGetBasicInfo(const JxlDecoder* dec,
       }
       info->orientation = JXL_ORIENT_IDENTITY;
     }
+    if (dec->decode_region_set) {
+      size_t x0;
+      size_t y0;
+      size_t region_xsize;
+      size_t region_ysize;
+      JXL_API_RETURN_IF_ERROR(GetDecodeRegionForImage(
+          dec, info->xsize, info->ysize, &x0, &y0, &region_xsize,
+          &region_ysize));
+      info->xsize = region_xsize;
+      info->ysize = region_ysize;
+    }
 
     info->intensity_target = meta.IntensityTarget();
     if (dec->desired_intensity_target > 0) {
@@ -2149,7 +2377,7 @@ JxlDecoderStatus JxlDecoderGetBasicInfo(const JxlDecoder* dec,
           TO_JXL_BOOL(dec->metadata.m.animation.have_timecodes);
     }
 
-    if (meta.have_intrinsic_size) {
+    if (meta.have_intrinsic_size && !dec->decode_region_set) {
       info->intrinsic_xsize = dec->metadata.m.intrinsic_size.xsize();
       info->intrinsic_ysize = dec->metadata.m.intrinsic_size.ysize();
     } else {
@@ -2371,6 +2599,9 @@ static JxlDecoderStatus GetMinSize(const JxlDecoder* dec,
   if (preview) {
     xsize = dec->metadata.oriented_preview_xsize(dec->keep_orientation);
     ysize = dec->metadata.oriented_preview_ysize(dec->keep_orientation);
+  } else if (num_channels == 0) {
+    JXL_API_RETURN_IF_ERROR(
+        GetCurrentOutputDimensions(dec, /*preview=*/false, &xsize, &ysize));
   } else {
     GetCurrentDimensions(dec, xsize, ysize);
   }
@@ -2470,6 +2701,10 @@ JxlDecoderStatus JxlDecoderExtraChannelBufferSize(const JxlDecoder* dec,
   if (!dec->got_basic_info || !(dec->orig_events_wanted & JXL_DEC_FULL_IMAGE)) {
     return JXL_API_ERROR("No extra channel buffer needed at this time");
   }
+  if (dec->decode_region_set) {
+    return JXL_API_ERROR(
+        "Extra channel output with decode region is not supported");
+  }
 
   if (index >= dec->metadata.m.num_extra_channels) {
     return JXL_API_ERROR("Invalid extra channel index");
@@ -2482,6 +2717,10 @@ JxlDecoderStatus JxlDecoderSetExtraChannelBuffer(JxlDecoder* dec,
                                                  const JxlPixelFormat* format,
                                                  void* buffer, size_t size,
                                                  uint32_t index) {
+  if (dec->decode_region_set) {
+    return JXL_API_ERROR(
+        "Extra channel output with decode region is not supported");
+  }
   size_t min_size;
   // This also checks whether the format and index are valid and supported and
   // basic info is available.
@@ -2577,10 +2816,19 @@ JxlDecoderStatus JxlDecoderGetFrameHeader(const JxlDecoder* dec,
   header->is_last = TO_JXL_BOOL(dec->frame_header->is_last);
   size_t xsize;
   size_t ysize;
-  GetCurrentDimensions(dec, xsize, ysize);
+  if (DecodeRegionAppliesToCurrentImage(dec)) {
+    JXL_API_RETURN_IF_ERROR(
+        GetCurrentOutputDimensions(dec, /*preview=*/false, &xsize, &ysize));
+  } else {
+    GetCurrentDimensions(dec, xsize, ysize);
+  }
   header->layer_info.xsize = xsize;
   header->layer_info.ysize = ysize;
-  if (!dec->coalescing && dec->frame_header->custom_size_or_origin) {
+  if (DecodeRegionAppliesToCurrentImage(dec)) {
+    header->layer_info.crop_x0 = 0;
+    header->layer_info.crop_y0 = 0;
+    header->layer_info.have_crop = JXL_FALSE;
+  } else if (!dec->coalescing && dec->frame_header->custom_size_or_origin) {
     header->layer_info.crop_x0 = dec->frame_header->frame_origin.x0;
     header->layer_info.crop_y0 = dec->frame_header->frame_origin.y0;
     header->layer_info.have_crop = JXL_TRUE;

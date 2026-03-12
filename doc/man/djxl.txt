@@ -43,6 +43,12 @@ Options
     enables the --pixels_to_jpeg option.
 
 
+--region='X0,Y0,X1,Y1'::
+    Output only the given rectangle in full-image pixel coordinates.
+    `X1` and `Y1` are exclusive.
+    Note: decoding may still process pixels outside the region.
+
+
 Examples
 --------
 
